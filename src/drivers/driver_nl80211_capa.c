@@ -715,9 +715,18 @@ static void wiphy_info_ext_feature_flags(struct wiphy_info_data *info,
 			      NL80211_EXT_FEATURE_OWE_OFFLOAD_AP))
 		capa->flags2 |= WPA_DRIVER_FLAGS2_OWE_OFFLOAD_AP;
 
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+	/* sprdwl_ng's firmware does AP-mode SAE itself; we ferry the
+	 * passphrase to it via a Samsung-OUI vendor command.  Force the
+	 * offload-AP capability so hostapd populates
+	 * params->sae_password / sae_pwe in wpa_driver_ap_params and our
+	 * sprd_send_sae_param_ap() hook in nl80211_set_ap can pick it up. */
+	capa->flags2 |= WPA_DRIVER_FLAGS2_SAE_OFFLOAD_AP;
+#else
 	if (ext_feature_isset(ext_features, len,
 			      NL80211_EXT_FEATURE_SAE_OFFLOAD_AP))
 		capa->flags2 |= WPA_DRIVER_FLAGS2_SAE_OFFLOAD_AP;
+#endif
 
 	if (ext_feature_isset(ext_features, len,
 			      NL80211_EXT_FEATURE_SPP_AMSDU_SUPPORT))

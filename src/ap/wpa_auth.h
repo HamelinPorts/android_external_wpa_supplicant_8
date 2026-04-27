@@ -515,6 +515,11 @@ int wpa_auth_pmksa_add_sae(struct wpa_authenticator *wpa_auth, const u8 *addr,
 			   const u8 *pmk, size_t pmk_len, const u8 *pmkid,
 			   int akmp, bool is_ml);
 void wpa_auth_add_sae_pmkid(struct wpa_state_machine *sm, const u8 *pmkid);
+/* Mark a station as having completed SAE-AP offload — the firmware did
+ * the SAE Auth + 4-way internally, so wpa_auth_sta_associated should
+ * skip the EAPOL exchange and jump directly to PTKINITDONE.  Reuses the
+ * same skip path as FT/FILS already-completed handling. */
+void wpa_auth_set_sae_offload_completed(struct wpa_state_machine *sm);
 int wpa_auth_pmksa_add2(struct wpa_authenticator *wpa_auth, const u8 *addr,
 			const u8 *pmk, size_t pmk_len, const u8 *pmkid,
 			int session_timeout, int akmp, const u8 *dpp_pkhash,

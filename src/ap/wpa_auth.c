@@ -1049,6 +1049,14 @@ int wpa_auth_sta_associated(struct wpa_authenticator *wpa_auth,
 	}
 #endif /* CONFIG_IEEE80211R_AP */
 
+	if (sm->sae_offload_completed) {
+		wpa_auth_logger(wpa_auth, wpa_auth_get_spa(sm), LOGGER_DEBUG,
+				"SAE-AP offload — driver/firmware did 4-way, skip user-space handshake");
+		sm->wpa_ptk_state = WPA_PTK_PTKINITDONE;
+		sm->Pair = true;
+		return 0;
+	}
+
 #ifdef CONFIG_FILS
 	if (sm->fils_completed) {
 		wpa_auth_logger(wpa_auth, wpa_auth_get_spa(sm), LOGGER_DEBUG,
@@ -4857,6 +4865,42 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
 		wpa_ie = wpa_ie_buf;
 	}
 #endif /* CONFIG_TESTING_OPTIONS */
+
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+	/* The sprdwl_ng AP-mode beacon does not carry an RSNXE element.
+	 * If 3/4 msg includes one, the station correctly rejects with
+	 * "WPA: RSNXE mismatch between Beacon/ProbeResp and EAPOL-Key
+	 * msg 3/4" and disassociates with reason 17.  Strip RSNXE
+	 * (element ID 0xf4) from the IE block before signing the
+	 * EAPOL-Key frame so beacon and 3/4 match. */
+	{
+		const u8 *p = wpa_ie;
+		const u8 *end = wpa_ie + wpa_ie_len;
+		u8 *out, *new_buf;
+		size_t out_len = 0;
+
+		new_buf = os_malloc(wpa_ie_len);
+		if (!new_buf)
+			goto done;
+		out = new_buf;
+		while (p + 2 <= end) {
+			size_t n = 2 + p[1];
+
+			if (p + n > end)
+				break;
+			if (p[0] != WLAN_EID_RSNX) {
+				os_memcpy(out + out_len, p, n);
+				out_len += n;
+			}
+			p += n;
+		}
+		os_free(wpa_ie_buf3);
+		wpa_ie_buf3 = new_buf;
+		wpa_ie = new_buf;
+		wpa_ie_len = out_len;
+	}
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
+
 	wpa_auth_logger(sm->wpa_auth, wpa_auth_get_spa(sm), LOGGER_DEBUG,
 			"sending 3/4 msg of 4-Way Handshake");
 	if (sm->wpa == WPA_VERSION_WPA2) {
@@ -6550,6 +6594,28 @@ int wpa_auth_pmksa_add_preauth(struct wpa_authenticator *wpa_auth,
 		return 0;
 
 	return -1;
+}
+
+
+/* Mirror the FT/FILS-completed skip-4-way path for SAE-AP offload.  When
+ * the firmware did the SAE Authentication and the EAPOL 4-way handshake
+ * itself (e.g. sprdwl_ng on the Samsung-OUI build), hostapd's user-space
+ * EAPOL state machine must NOT drive a second 4-way — the station already
+ * considers itself authorised and would silently drop our retry frames.
+ *
+ * We can't reuse `fils_completed` (CONFIG_FILS) or `ft_completed`
+ * (CONFIG_IEEE80211R_AP) — the device build has neither enabled.  Just
+ * set the same effective wpa_state_machine fields those paths set
+ * (wpa_ptk_state = WPA_PTK_PTKINITDONE, Pair = true) so the next
+ * wpa_sm_step() short-circuits to the authorised state. */
+void wpa_auth_set_sae_offload_completed(struct wpa_state_machine *sm)
+{
+	if (!sm)
+		return;
+	wpa_printf(MSG_DEBUG,
+		   "WPA: SAE-AP offload — skip user-space 4-way for "
+		   MACSTR, MAC2STR(sm->addr));
+	sm->sae_offload_completed = 1;
 }
 
 

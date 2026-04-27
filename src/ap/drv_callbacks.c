@@ -310,6 +310,69 @@ static struct hostapd_data * hostapd_find_by_sta(struct hostapd_iface *iface,
 #endif /* HOSTAPD || CONFIG_IEEE80211BE */
 
 
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+/* sprdwl_ng's firmware runs SAE Authentication itself in AP mode and
+ * delivers the derived PMK + PMKID back to userspace as a Samsung-OUI
+ * vendor IE in the assoc-request IE buffer.  Wire format:
+ *
+ *   DD 34 40 45 DA 04 <PMK 32> <PMKID 16>
+ *
+ * (STA side uses OUI-type 0x03; AP side uses 0x04.) */
+#define SPRD_AP_SAE_RESULT_HDR_LEN 6
+#define SPRD_AP_SAE_RESULT_PMK_LEN 32
+#define SPRD_AP_SAE_RESULT_PMKID_LEN 16
+#define SPRD_AP_SAE_RESULT_TOTAL_LEN \
+	(SPRD_AP_SAE_RESULT_HDR_LEN + SPRD_AP_SAE_RESULT_PMK_LEN + \
+	 SPRD_AP_SAE_RESULT_PMKID_LEN)
+
+static int sprd_install_ap_sae_pmk(struct hostapd_data *hapd,
+				   const u8 *addr, const u8 *ie)
+{
+	const u8 *pmk = ie + SPRD_AP_SAE_RESULT_HDR_LEN;
+	const u8 *pmkid = pmk + SPRD_AP_SAE_RESULT_PMK_LEN;
+
+	wpa_printf(MSG_DEBUG, "SPRD SAE: Using SAE PMKSA caching for "
+		   MACSTR, MAC2STR(addr));
+	wpa_hexdump_key(MSG_DEBUG, "SPRD SAE PMK:", pmk,
+			SPRD_AP_SAE_RESULT_PMK_LEN);
+	wpa_hexdump(MSG_DEBUG, "SPRD SAE PMKID:", pmkid,
+		    SPRD_AP_SAE_RESULT_PMKID_LEN);
+	return wpa_auth_pmksa_add_sae(hapd->wpa_auth, addr,
+				      pmk, SPRD_AP_SAE_RESULT_PMK_LEN, pmkid,
+				      WPA_KEY_MGMT_SAE, false);
+}
+
+
+static int sprd_extract_ap_sae_pmk(struct hostapd_data *hapd, const u8 *addr,
+				   const u8 *ies, size_t ies_len)
+{
+	const u8 sprd_oui[] = { 0x40, 0x45, 0xda };
+	const u8 *p = ies;
+	const u8 *end;
+
+	if (!ies || ies_len < 2)
+		return 0;
+	end = ies + ies_len;
+	while (p + 2 <= end) {
+		u8 id = p[0];
+		u8 ie_len = p[1];
+
+		if (p + 2 + ie_len > end)
+			break;
+		if (id == 0xdd && ie_len >= 4 + SPRD_AP_SAE_RESULT_PMK_LEN +
+		    SPRD_AP_SAE_RESULT_PMKID_LEN &&
+		    os_memcmp(p + 2, sprd_oui, sizeof(sprd_oui)) == 0 &&
+		    p[2 + 3] == 0x04)
+			return sprd_install_ap_sae_pmk(hapd, addr, p);
+		p += 2 + ie_len;
+	}
+	wpa_printf(MSG_DEBUG,
+		   "SPRD: No SAE PMK found - sta may be not sae configuration, ignore");
+	return 0;
+}
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
+
+
 int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
 			const u8 *req_ies, size_t req_ies_len,
 			const u8 *resp_ies, size_t resp_ies_len,
@@ -360,6 +423,16 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
 
 	hostapd_logger(hapd, addr, HOSTAPD_MODULE_IEEE80211,
 		       HOSTAPD_LEVEL_INFO, "associated");
+
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+	/* sprdwl_ng's firmware ran SAE Authentication itself and embedded
+	 * the derived PMK + PMKID as a Samsung-OUI vendor IE inside the
+	 * client's assoc-request IEs.  Stash the PMK in our PMKSA cache
+	 * before wpa_validate_wpa_ie() looks up the client's PMKID — that
+	 * way the standard upstream "PMKSA cache hit" path runs and the
+	 * 4-way handshake proceeds normally. */
+	(void) sprd_extract_ap_sae_pmk(hapd, addr, req_ies, req_ies_len);
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
 
 	if (ieee802_11_parse_elems(req_ies, req_ies_len, &elems, 0) ==
 	    ParseFailed) {
@@ -661,6 +734,15 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
 			sta->flags |= WLAN_STA_SPP_AMSDU;
 		else
 			sta->flags &= ~WLAN_STA_SPP_AMSDU;
+
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+		/* SAE-AP offload skip-4-way path is implemented in
+		 * wpa_auth_set_sae_offload_completed() but disabled for now —
+		 * Pixel-class clients still expect to drive the 4-way after
+		 * association.  Skipping leads them to disassoc after a 10-s
+		 * EAPOL wait. */
+		(void) wpa_auth_set_sae_offload_completed;
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
 
 #ifdef CONFIG_IEEE80211R_AP
 		if (sta->auth_alg == WLAN_AUTH_FT) {

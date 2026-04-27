@@ -95,6 +95,10 @@ struct wpa_state_machine {
 	unsigned int ft_completed:1;
 	unsigned int pmk_r1_name_valid:1;
 #endif /* CONFIG_IEEE80211R_AP */
+	/* Driver / firmware did SAE Auth + 4-way internally; skip the
+	 * user-space EAPOL state machine (mirrors ft_completed/fils_completed
+	 * behaviour but always compiled in). */
+	unsigned int sae_offload_completed:1;
 	unsigned int is_wnmsleep:1;
 	unsigned int pmkid_set:1;
 	unsigned int spp_amsdu:1;

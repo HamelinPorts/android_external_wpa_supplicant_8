@@ -3588,6 +3588,98 @@ static int sprd_build_sae_ie(const char *password, size_t password_len,
 
 	return 0;
 }
+
+
+/* SPRD vendor sub-cmd numbers reused on the QCA OUI for sprdwl_ng. */
+#define SPRD_VENDOR_SCMD_SAE_PARAM	0x2b
+
+/* Outer attrs inside NL80211_ATTR_VENDOR_DATA on the SAE_PARAM sub-cmd
+ * (AP-side path).  Inner per-peer SAE-password entries are nested under
+ * attr 0 and re-use these inner attr numbers.  We only emit the
+ * global-passphrase variant (no per-peer entries) which is enough for
+ * SoftAP / tethering. */
+enum sprd_sae_ap_attr {
+	SPRD_SAE_AP_ATTR_PASSWORD	= 1,	/* string (also inside nest 0) */
+	SPRD_SAE_AP_ATTR_IDENTIFIER	= 2,	/* string (per-peer only) */
+	SPRD_SAE_AP_ATTR_PEER_MAC	= 3,	/* 6 bytes (per-peer only) */
+	SPRD_SAE_AP_ATTR_FLAGS_PEER	= 4,	/* u32 (per-peer only) */
+	SPRD_SAE_AP_ATTR_GROUPS		= 5,	/* u32[] supported SAE groups */
+	SPRD_SAE_AP_ATTR_PWE		= 6,	/* u32 (sae_pwe: 0 H&P, 2 H2E) */
+	SPRD_SAE_AP_ATTR_GLOBAL_PSK	= 7,	/* string — single-AP variant */
+};
+
+
+/* Tell the firmware the SAE configuration for an AP-mode BSS.
+ *
+ * The vendor command is emitted right after the standard
+ * NL80211_CMD_SET_BEACON / SET_AP completes.  Without it the firmware's
+ * internal SAE state machine has no passphrase: every Authentication
+ * frame from a station times out, and the kernel reports
+ * `WIFI_EVENT_STA_LUT_INDEX → disconnect, flush qoslist`.  When the
+ * client retries with PMKID-based fast reconnect, hostapd has no PMK in
+ * cache and rejects with reason_code=49 (invalid PMKID). */
+static int sprd_send_sae_param_ap(struct wpa_driver_nl80211_data *drv,
+				  const char *password, size_t password_len,
+				  enum sae_pwe sae_pwe)
+{
+	struct nl_msg *msg;
+	struct nlattr *vendor_data;
+	int ret;
+	u32 pwe;
+
+	if (!password || password_len == 0 || password_len > 0xff) {
+		wpa_printf(MSG_DEBUG,
+			   "nl80211: SPRD SAE AP: no/invalid password");
+		return -EINVAL;
+	}
+
+	msg = nl80211_drv_msg(drv, 0, NL80211_CMD_VENDOR);
+	if (!msg ||
+	    nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, OUI_QCA) ||
+	    nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD,
+			SPRD_VENDOR_SCMD_SAE_PARAM)) {
+		wpa_printf(MSG_DEBUG, "SPRD SAE AP: Failed to alloc SAE nl_msg");
+		nl80211_nlmsg_clear(msg);
+		nlmsg_free(msg);
+		return -ENOBUFS;
+	}
+
+	vendor_data = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA);
+	if (!vendor_data)
+		goto fail;
+
+	/* Pass the sae_pwe enum value through verbatim.  Upstream uses
+	 * 0 = hunt-and-peck only, 1 = hash-to-element only, 2 = both. */
+	pwe = (u32) sae_pwe;
+	if (nla_put_u32(msg, SPRD_SAE_AP_ATTR_PWE, pwe))
+		goto fail;
+
+	/* attr 7: global passphrase.  We don't emit per-peer entries
+	 * (attr 0 nest) for the SoftAP path. */
+	if (nla_put(msg, SPRD_SAE_AP_ATTR_GLOBAL_PSK, password_len,
+		    password))
+		goto fail;
+
+	nla_nest_end(msg, vendor_data);
+
+	ret = send_and_recv_cmd(drv, msg);
+	if (ret) {
+		wpa_printf(MSG_DEBUG,
+			   "nl80211: SPRD set SAE INFO failed for AP mode err=%d",
+			   ret);
+	} else {
+		wpa_printf(MSG_DEBUG,
+			   "nl80211: SPRD set SAE INFO OK for AP mode (pwe=%u, psk_len=%zu)",
+			   pwe, password_len);
+	}
+	return ret;
+
+fail:
+	wpa_printf(MSG_DEBUG, "SPRD: SAE: Failed to set sae parameters");
+	nl80211_nlmsg_clear(msg);
+	nlmsg_free(msg);
+	return -ENOBUFS;
+}
 #endif /* CONFIG_DRIVER_NL80211_SPRD */
 
 #if defined(CONFIG_DRIVER_NL80211_BRCM) || defined(CONFIG_DRIVER_NL80211_SYNA)
@@ -3723,11 +3815,24 @@ static int wpa_driver_nl80211_set_key(struct i802_bss *bss,
 	}
 
 	if (key_flag & KEY_FLAG_NEXT) {
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+		/* sprdwl_ng has only a single PTK slot, so the "next TK for
+		 * RX-only" install is what hostapd uses just before waiting
+		 * for EAPOL-Key 4/4.  Without installing it, the firmware
+		 * can't decrypt clients that encrypt their 4/4 reply (e.g.
+		 * Pixel) and the 4-way stalls after 3/4.  Drop NEXT here so
+		 * the standard pairwise install path runs and the PTK is
+		 * loaded for RX before 4/4 arrives. */
+		wpa_printf(MSG_DEBUG,
+			   "nl80211: SPRD set_key for next TK — strip NEXT, install PTK for RX");
+		key_flag &= ~KEY_FLAG_NEXT;
+#else
 		/* For now, ignore these since this needs support from the
 		 * driver to handle the special cases of two active RX keys. */
 		wpa_printf(MSG_DEBUG,
 			   "nl80211: set_key for the next TK for RX-only - ignored");
 		return -EOPNOTSUPP;
+#endif
 	}
 
 	ret = -ENOBUFS;
@@ -5457,12 +5562,19 @@ static int wpa_driver_nl80211_set_ap(void *priv,
 	    nla_put(msg, NL80211_ATTR_PMK, params->psk_len, params->psk))
 		goto fail;
 
+#ifndef CONFIG_DRIVER_NL80211_SPRD
+	/* sprdwl_ng accepts the AP-side SAE password via the SPRD vendor
+	 * command in sprd_send_sae_param_ap() (called below).  The
+	 * standard NL80211_ATTR_SAE_PASSWORD on SET_BEACON is intentionally
+	 * omitted here so the kernel doesn't see a duplicate / conflicting
+	 * passphrase carrier. */
 	if (wpa_key_mgmt_sae(params->key_mgmt_suites) &&
 	    (drv->capa.flags2 & WPA_DRIVER_FLAGS2_SAE_OFFLOAD_AP) &&
 	    params->sae_password &&
 	    nla_put(msg, NL80211_ATTR_SAE_PASSWORD,
 		    os_strlen(params->sae_password), params->sae_password))
 		goto fail;
+#endif
 
 	if (nl80211_put_control_port(drv, msg) < 0)
 		goto fail;
@@ -5699,6 +5811,24 @@ static int wpa_driver_nl80211_set_ap(void *priv,
 				NL80211_DRV_LINK_ID_NA);
 		nl80211_set_multicast_to_unicast(bss,
 						 params->multicast_to_unicast);
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+		/* sprdwl_ng's firmware runs SAE Authentication itself in AP
+		 * mode (it doesn't relay 802.11 Auth frames to userspace).
+		 * Tell it the SAE password via an SPRD vendor command after
+		 * the standard SET_BEACON / NEW_BEACON has succeeded; without
+		 * it, every Auth Commit from a station times out and we never
+		 * see a NEW_STATION event. */
+		wpa_printf(MSG_DEBUG,
+			   "nl80211: SPRD AP-side SAE check: key_mgmt_suites=0x%x sae_password=%s",
+			   params->key_mgmt_suites,
+			   params->sae_password ? "set" : "NULL");
+		if (wpa_key_mgmt_sae(params->key_mgmt_suites) &&
+		    params->sae_password) {
+			(void) sprd_send_sae_param_ap(drv, params->sae_password,
+						      os_strlen(params->sae_password),
+						      params->sae_pwe);
+		}
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
 		if (beacon_set && params->freq &&
 		    params->freq->bandwidth != link->bandwidth) {
 			wpa_printf(MSG_DEBUG,
@@ -8101,6 +8231,18 @@ static int i802_get_seqnum(const char *iface, void *priv, const u8 *addr,
 		wpa_printf(MSG_DEBUG,
 			   "nl80211: Failed to get current TX sequence for a key (link_id=%d idx=%d): %d (%s)",
 			   link_id, idx, res, strerror(-res));
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+		/* sprdwl_ng doesn't implement NL80211_CMD_GET_KEY for the
+		 * per-key TX sequence number.  Treat -EOPNOTSUPP as
+		 * "sequence number is 0" (the buffer is already zeroed
+		 * above) so the caller emits a clean RSC into the GTK /
+		 * IGTK KDE in EAPOL-Key 3/4.  Without this, the failure
+		 * propagates and corrupts the GTK KDE in 3/4 — Pixel-class
+		 * clients then silently drop the frame (MIC verification
+		 * fails) and never reply 4/4. */
+		if (res == -EOPNOTSUPP)
+			return 0;
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
 	}
 
 	return res;
