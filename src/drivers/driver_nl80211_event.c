@@ -19,7 +19,7 @@
 #include "common/ieee802_11_defs.h"
 #include "common/ieee802_11_common.h"
 #include "driver_nl80211.h"
-#ifdef CONFIG_BRCM_SAE
+#if !defined(HOSTAPD) && (defined(CONFIG_BRCM_SAE) || defined(CONFIG_DRIVER_NL80211_SPRD))
 #include "rsn_supp/wpa.h"
 #include "rsn_supp/wpa_i.h"
 #include "wpa_supplicant_i.h"
@@ -29,6 +29,18 @@ static void
 nl80211_control_port_frame_tx_status(struct i802_bss *bss,
 				     const u8 *frame, size_t len,
 				     struct nlattr *ack, struct nlattr *cookie);
+
+#if !defined(HOSTAPD) && defined(CONFIG_DRIVER_NL80211_SPRD)
+#define SPRD_SAE_RESULT_HDR_LEN 6
+#define SPRD_SAE_RESULT_PMK_LEN 32
+#define SPRD_SAE_RESULT_PMKID_LEN 16
+#define SPRD_SAE_RESULT_TOTAL_LEN \
+	(SPRD_SAE_RESULT_HDR_LEN + SPRD_SAE_RESULT_PMK_LEN + \
+	 SPRD_SAE_RESULT_PMKID_LEN)
+static int sprd_scan_ies_for_sae_pmk(struct wpa_driver_nl80211_data *drv,
+				     const u8 *buf, size_t buf_len,
+				     const char *label);
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
 
 
 static const char * nl80211_command_to_string(enum nl80211_commands cmd)
@@ -1058,6 +1070,16 @@ static void mlme_event_connect(struct wpa_driver_nl80211_data *drv,
 		event.assoc_info.resp_ies = nla_data(resp_ie);
 		event.assoc_info.resp_ies_len = nla_len(resp_ie);
 	}
+
+#if !defined(HOSTAPD) && defined(CONFIG_DRIVER_NL80211_SPRD)
+	/* sprdwl_ng delivers the firmware-derived SAE PMK as a Samsung-OUI
+	 * vendor IE embedded in NL80211_ATTR_RESP_IE of the connect event.
+	 * Install it before EVENT_ASSOC propagates so the PMK is in the
+	 * wpa_sm by the time EAPOL msg 1/4 is processed. */
+	if (resp_ie)
+		sprd_scan_ies_for_sae_pmk(drv, nla_data(resp_ie),
+					  nla_len(resp_ie), "resp_ie");
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
 
 	event.assoc_info.freq = nl80211_get_assoc_freq(drv);
 	drv->first_bss->flink->freq = drv->assoc_freq;
@@ -2274,6 +2296,22 @@ static void nl80211_new_station_event(struct wpa_driver_nl80211_data *drv,
 			req_ies_len = nla_len(tb[NL80211_ATTR_IE]);
 			wpa_hexdump(MSG_DEBUG, "nl80211: Assoc Req IEs",
 				    req_ies, req_ies_len);
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+			/* DIAGNOSTIC: dump in 32-byte chunks to dodge logcat
+			 * line truncation while we verify the SPRD AP-side
+			 * SAE PMK delivery format (`dd ?? 40 45 DA 04 …`). */
+			{
+				size_t off;
+				for (off = 0; off < req_ies_len; off += 32) {
+					size_t n = req_ies_len - off;
+					if (n > 32)
+						n = 32;
+					wpa_hexdump(MSG_DEBUG,
+						    "nl80211: SPRD Assoc Req IEs chunk",
+						    req_ies + off, n);
+				}
+			}
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
 		}
 
 		if (tb[NL80211_ATTR_RESP_IE]) {
@@ -3302,9 +3340,107 @@ static void qca_nl80211_pasn_auth(struct i802_bss *bss, u8 *data, size_t len)
 #endif /* CONFIG_DRIVER_NL80211_QCA */
 
 
+#if !defined(HOSTAPD) && defined(CONFIG_DRIVER_NL80211_SPRD)
+/* Spreadtrum SAE result IE.
+ *
+ * After a successful firmware-side SAE handshake, sprdwl_ng injects a
+ * vendor IE containing the derived PMK and PMKID into the connect event.
+ * Wire format:
+ *
+ *   dd 34 40 45 DA 03  <PMK 32>  <PMKID 16>
+ *    │  │  │ │ │ │ │
+ *    │  │  └─┴─┴─┘ └── OUI type 0x03 (downlink SAE result)
+ *    │  │  Samsung OUI 40:45:DA
+ *    │  Element length (52 = 4 + 32 + 16)
+ *    Element ID 0xdd (vendor specific)
+ *
+ * The IE arrives via two carriers: a NL80211_CMD_VENDOR event under the
+ * QCA OUI (handled by sprd_handle_sae_result), and embedded in the
+ * NL80211_ATTR_RESP_IE of the CMD_CONNECT event (handled by
+ * sprd_scan_ies_for_sae_pmk).  Both helpers feed sprd_install_sae_pmk.
+ * Macros and forward declarations live near the top of this file. */
+
+static int sprd_install_sae_pmk(struct wpa_driver_nl80211_data *drv,
+				const u8 *ie, const char *src)
+{
+	struct wpa_supplicant *wpa_s = drv->ctx;
+	struct wpa_sm *sm;
+	const u8 *pmk = ie + SPRD_SAE_RESULT_HDR_LEN;
+	const u8 *pmkid = pmk + SPRD_SAE_RESULT_PMK_LEN;
+
+	if (!wpa_s)
+		return 0;
+	sm = wpa_s->wpa;
+	if (!sm)
+		return 0;
+
+	wpa_printf(MSG_DEBUG,
+		   "nl80211: SPRD SAE result (%s) for " MACSTR,
+		   src, MAC2STR(drv->bssid));
+	wpa_hexdump_key(MSG_DEBUG, "nl80211: SPRD SAE PMK", pmk,
+			SPRD_SAE_RESULT_PMK_LEN);
+	wpa_hexdump(MSG_DEBUG, "nl80211: SPRD SAE PMKID", pmkid,
+		    SPRD_SAE_RESULT_PMKID_LEN);
+
+	wpa_sm_set_pmk(sm, pmk, SPRD_SAE_RESULT_PMK_LEN, pmkid, drv->bssid);
+	return 1;
+}
+
+
+/* Match a buffer that already starts with the full SAE result IE.  Used by
+ * the vendor-event path where the firmware payload is the IE itself. */
+static int sprd_handle_sae_result(struct wpa_driver_nl80211_data *drv,
+				  u32 subcmd, const u8 *data, size_t len)
+{
+	const u8 expected_hdr[] = { 0xdd, 0x34, 0x40, 0x45, 0xda, 0x03 };
+	char src[32];
+
+	if (len < SPRD_SAE_RESULT_TOTAL_LEN ||
+	    os_memcmp(data, expected_hdr, sizeof(expected_hdr)) != 0)
+		return 0;
+
+	os_snprintf(src, sizeof(src), "vendor subcmd=%u", subcmd);
+	return sprd_install_sae_pmk(drv, data, src);
+}
+
+
+/* Walk an arbitrary IE buffer (e.g. CMD_CONNECT req_ie / resp_ie) for the
+ * SPRD SAE result vendor IE.  Returns 1 if found and installed. */
+static int sprd_scan_ies_for_sae_pmk(struct wpa_driver_nl80211_data *drv,
+				     const u8 *buf, size_t buf_len,
+				     const char *label)
+{
+	const u8 sprd_oui[] = { 0x40, 0x45, 0xda };
+	const u8 *p = buf;
+	const u8 *end = buf + buf_len;
+
+	if (!buf || buf_len < 2)
+		return 0;
+
+	while (p + 2 <= end) {
+		u8 id = p[0];
+		u8 ie_len = p[1];
+
+		if (p + 2 + ie_len > end)
+			break;
+		if (id == 0xdd && ie_len >= 4 + SPRD_SAE_RESULT_PMK_LEN +
+		    SPRD_SAE_RESULT_PMKID_LEN &&
+		    os_memcmp(p + 2, sprd_oui, sizeof(sprd_oui)) == 0 &&
+		    p[2 + 3] == 0x03)
+			return sprd_install_sae_pmk(drv, p, label);
+		p += 2 + ie_len;
+	}
+	return 0;
+}
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
+
 static void nl80211_vendor_event_qca(struct i802_bss *bss,
 				     u32 subcmd, u8 *data, size_t len)
 {
+#if !defined(HOSTAPD) && defined(CONFIG_DRIVER_NL80211_SPRD)
+	if (sprd_handle_sae_result(bss->drv, subcmd, data, len))
+		return;
+#endif
 	switch (subcmd) {
 	case QCA_NL80211_VENDOR_SUBCMD_TEST:
 		wpa_hexdump(MSG_DEBUG, "nl80211: QCA test event", data, len);

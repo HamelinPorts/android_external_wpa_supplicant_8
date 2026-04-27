@@ -3533,6 +3533,63 @@ static int bcmdhd_set_sae_password(struct wpa_driver_nl80211_data *drv,
 }
 #endif /* CONFIG_BRCM_SAE */
 
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+/* Spreadtrum / UNISOC sprdwl_ng vendor SAE protocol.
+ *
+ * The driver advertises SAE capability to the framework, but does not
+ * implement NL80211_CMD_REGISTER_FRAME for 802.11 Auth frames or
+ * NL80211_CMD_EXTERNAL_AUTH — so wpa_supplicant cannot drive SAE over the
+ * standard paths.  The firmware runs the SAE state machine internally,
+ * and userspace ferries the passphrase to it as a Samsung-OUI vendor IE
+ * appended to NL80211_ATTR_IE of NL80211_CMD_CONNECT.  After the firmware
+ * completes SAE it returns the derived PMK + PMKID inside another vendor
+ * IE embedded in NL80211_ATTR_RESP_IE of the connect event (decoded in
+ * driver_nl80211_event.c). */
+
+/* Build the Spreadtrum vendor SAE IE.  Wire format:
+ *
+ *   DD <len>            802.11 vendor-specific element header
+ *   40 45 DA 02         Samsung OUI + OUI-type 0x02 (uplink SAE info)
+ *   00                  TLV type byte (0x00 = PSK)
+ *   <psk_len> <psk>     plaintext SAE passphrase
+ *
+ * Example IE for a 20-byte passphrase: 28 bytes total
+ * (DD 1a 40 45 da 02 00 14 <20>).  Caller frees *ie. */
+static int sprd_build_sae_ie(const char *password, size_t password_len,
+			     u8 **ie, size_t *ie_len)
+{
+	size_t total;
+	u8 *p;
+
+	if (!password || password_len == 0 || password_len > 0xff)
+		return -EINVAL;
+
+	total = 6 /* DD <len> 40 45 DA 02 */ + 1 /* type 0x00 */ +
+		1 + password_len;
+	if (total > 257)
+		return -EOVERFLOW;
+
+	p = os_malloc(total);
+	if (!p)
+		return -ENOMEM;
+
+	*ie = p;
+	*ie_len = total;
+
+	*p++ = 0xdd;			/* element ID */
+	*p++ = (u8)(total - 2);		/* element length */
+	*p++ = 0x40;			/* OUI byte 0 */
+	*p++ = 0x45;			/* OUI byte 1 */
+	*p++ = 0xda;			/* OUI byte 2 */
+	*p++ = 0x02;			/* OUI type — uplink SAE info */
+	*p++ = 0x00;			/* TLV type 0x00 = PSK */
+	*p++ = (u8)password_len;
+	os_memcpy(p, password, password_len);
+
+	return 0;
+}
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
+
 #if defined(CONFIG_DRIVER_NL80211_BRCM) || defined(CONFIG_DRIVER_NL80211_SYNA)
 static int key_mgmt_set_key(struct wpa_driver_nl80211_data *drv,
 				  const u8 *key, size_t key_len)
@@ -6999,10 +7056,83 @@ static int nl80211_connect_common(struct wpa_driver_nl80211_data *drv,
 		drv->ssid_len = params->ssid_len;
 	}
 
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+	/* Spreadtrum sprdwl_ng expects the SAE passphrase in a Samsung-OUI
+	 * vendor IE appended to the assoc-request IEs (NL80211_ATTR_IE).
+	 * Concatenate the IE with the standard wpa_ie and emit a single
+	 * nla_put — the kernel only accepts one ATTR_IE per CONNECT. */
+	{
+		u8 *sprd_sae_ie = NULL;
+		size_t sprd_sae_ie_len = 0;
+		const char *sprd_password = params->sae_password ?
+			params->sae_password : params->passphrase;
+
+		if ((wpa_key_mgmt_sae(params->key_mgmt_suite) ||
+		     wpa_key_mgmt_sae(params->allowed_key_mgmts)) &&
+		    sprd_password &&
+		    sprd_build_sae_ie(sprd_password, os_strlen(sprd_password),
+				      &sprd_sae_ie, &sprd_sae_ie_len) == 0) {
+			size_t combined_len = params->wpa_ie_len +
+					      sprd_sae_ie_len;
+			u8 *combined = os_malloc(combined_len);
+
+			if (combined) {
+				size_t copied = 0;
+
+				/* Strip RSNXE (element ID 0xf4) from the IE
+				 * block before concatenation.  When the AP
+				 * advertises no RSNXE itself (Zuhause.All
+				 * on 5 GHz channel 48 is one such case),
+				 * appending our default RSNXE confuses the
+				 * firmware's internal SAE state machine and
+				 * the connect event returns status_code=16
+				 * (auth timeout) after ~8 s. */
+				if (params->wpa_ie_len) {
+					const u8 *p = params->wpa_ie;
+					const u8 *end = p +
+						params->wpa_ie_len;
+					while (p + 2 <= end) {
+						u8 id = p[0];
+						u8 ie_len = p[1];
+						size_t n = 2 + ie_len;
+
+						if (p + n > end)
+							break;
+						if (id != 0xf4) {
+							os_memcpy(combined +
+								  copied,
+								  p, n);
+							copied += n;
+						}
+						p += n;
+					}
+				}
+				os_memcpy(combined + copied, sprd_sae_ie,
+					  sprd_sae_ie_len);
+				combined_len = copied + sprd_sae_ie_len;
+				wpa_hexdump(MSG_DEBUG,
+					    "nl80211: SPRD vendor SAE IE",
+					    sprd_sae_ie, sprd_sae_ie_len);
+				os_free(sprd_sae_ie);
+				if (nla_put(msg, NL80211_ATTR_IE, combined_len,
+					    combined)) {
+					os_free(combined);
+					return -1;
+				}
+				os_free(combined);
+				goto skip_standard_wpa_ie;
+			}
+			os_free(sprd_sae_ie);
+		}
+	}
+#endif /* CONFIG_DRIVER_NL80211_SPRD */
 	wpa_hexdump(MSG_DEBUG, "  * IEs", params->wpa_ie, params->wpa_ie_len);
 	if (params->wpa_ie &&
 	    nla_put(msg, NL80211_ATTR_IE, params->wpa_ie_len, params->wpa_ie))
 		return -1;
+#ifdef CONFIG_DRIVER_NL80211_SPRD
+skip_standard_wpa_ie:
+#endif
 
 	if (params->wpa_proto) {
 		enum nl80211_wpa_versions ver = 0;
