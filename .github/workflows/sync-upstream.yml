@@ -1,0 +1,150 @@
+name: Sync from LineageOS upstream
+
+# What this does:
+#   Weekly:
+#     1. Fast-forward every shared branch (lineage-*, cm-*, etc.) from
+#        upstream LineageOS/android_external_wpa_supplicant_8 — these
+#        are unmodified mirrors and only ever move forward.
+#     2. Rebase the default branch (gta8-sprd-sae, carrying the
+#        Spreadtrum vendor SAE patches on top of lineage-23.2) onto
+#        the freshly-synced upstream lineage-23.2.
+#   On rebase conflict: abort and open an issue.
+#
+# Scheduled-workflow note:
+#   GitHub fires scheduled workflows from the repo's default branch
+#   only. The default IS gta8-sprd-sae, so this file lives in the SAE
+#   patch stack and gets replayed on every rebase — self-perpetuating.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'    # Monday 06:00 UTC, matches Bluetooth/ImsMedia
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch (gta8-sprd-sae)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch both sides
+        run: |
+          git remote add upstream https://github.com/LineageOS/android_external_wpa_supplicant_8.git
+          git fetch origin   '+refs/heads/*:refs/remotes/origin/*'   --no-tags --prune
+          git fetch upstream '+refs/heads/*:refs/remotes/upstream/*' --no-tags --prune
+
+      - name: Fast-forward shared branches from upstream
+        run: |
+          set -e
+          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/upstream); do
+            b=${ref#upstream/}
+            [ "$b" = "HEAD" ] && continue
+            [ "$b" = "gta8-sprd-sae" ] && continue
+            if ! git show-ref --verify --quiet "refs/remotes/origin/$b"; then
+              continue
+            fi
+            ours=$(git rev-parse "refs/remotes/origin/$b")
+            theirs=$(git rev-parse "refs/remotes/upstream/$b")
+            if [ "$ours" = "$theirs" ]; then continue; fi
+            if git merge-base --is-ancestor "$ours" "$theirs"; then
+              echo "FF $b: $ours -> $theirs"
+              git push origin "$theirs:refs/heads/$b"
+            else
+              echo "::warning::$b diverged from upstream, skipping"
+            fi
+          done
+
+      - name: Check whether gta8-sprd-sae needs rebasing
+        id: diverge
+        run: |
+          BASE=$(git merge-base HEAD upstream/lineage-23.2)
+          TIP=$(git rev-parse upstream/lineage-23.2)
+          if [ "$BASE" = "$TIP" ]; then
+            echo "already_up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "gta8-sprd-sae already on tip of upstream/lineage-23.2; nothing to do."
+          else
+            COUNT=$(git rev-list --count "$BASE".."$TIP")
+            echo "already_up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "new_commits=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "upstream/lineage-23.2 has $COUNT new commit(s) since gta8-sprd-sae's base."
+          fi
+
+      - name: Attempt rebase onto upstream/lineage-23.2
+        id: rebase
+        if: steps.diverge.outputs.already_up_to_date != 'true'
+        continue-on-error: true
+        run: git rebase upstream/lineage-23.2
+
+      - name: Capture conflict report
+        if: >-
+          steps.diverge.outputs.already_up_to_date != 'true' &&
+          steps.rebase.outcome == 'failure'
+        id: conflict
+        run: |
+          {
+            echo "### Files with conflicts"
+            git diff --name-only --diff-filter=U | sed 's/^/- /'
+            echo ""
+            echo "### Status"
+            git status --short || true
+          } > /tmp/conflict.md
+          git rebase --abort || true
+          {
+            echo 'body<<EOF'
+            cat /tmp/conflict.md
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push clean rebase
+        if: >-
+          steps.diverge.outputs.already_up_to_date != 'true' &&
+          steps.rebase.outcome == 'success'
+        run: |
+          git push --force-with-lease origin gta8-sprd-sae
+          echo "Pushed rebased gta8-sprd-sae (${{ steps.diverge.outputs.new_commits }} upstream commit(s) absorbed)."
+
+      - name: Open issue on conflict
+        if: >-
+          steps.diverge.outputs.already_up_to_date != 'true' &&
+          steps.rebase.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = new Date().toISOString().slice(0, 10);
+            const body = `Automatic rebase of \`gta8-sprd-sae\` onto \`upstream/lineage-23.2\` on ${today} hit conflicts.
+
+            ${{ steps.conflict.outputs.body }}
+
+            Resolve locally:
+            \`\`\`sh
+            git remote add upstream https://github.com/LineageOS/android_external_wpa_supplicant_8.git
+            git fetch upstream
+            git checkout gta8-sprd-sae
+            git rebase upstream/lineage-23.2
+            # fix conflicts, git add, git rebase --continue
+            git push --force-with-lease origin gta8-sprd-sae
+            \`\`\`
+            `;
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Weekly rebase: conflicts with upstream (${today})`,
+              body: body,
+              labels: ['rebase-conflict']
+            });
